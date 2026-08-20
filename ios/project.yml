@@ -1,0 +1,52 @@
+name: ServerInfo
+options:
+  bundleIdPrefix: nl.merlinstoll
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+targets:
+  ServerInfo:
+    type: application
+    platform: iOS
+    sources:
+      - path: ServerInfo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nl.merlinstoll.serverinfo
+        PRODUCT_NAME: Server Info
+        INFOPLIST_FILE: ServerInfo/Resources/Info.plist
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+  ServerInfoUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ServerInfoUITests
+    dependencies:
+      - target: ServerInfo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nl.merlinstoll.serverinfo.uitests
+        TEST_TARGET_NAME: ServerInfo
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  ServerInfo:
+    build:
+      targets:
+        ServerInfo: all
+        ServerInfoUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ServerInfoUITests
