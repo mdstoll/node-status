@@ -1,4 +1,4 @@
-name: ServerInfo
+name: NodeStatus
 options:
   bundleIdPrefix: nl.merlinstoll
   deploymentTarget:
@@ -12,41 +12,41 @@ settings:
     DEVELOPMENT_TEAM: PH7ZL6P4M9
     CODE_SIGN_STYLE: Automatic
 targets:
-  ServerInfo:
+  NodeStatus:
     type: application
     platform: iOS
     sources:
-      - path: ServerInfo
+      - path: NodeStatus
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: nl.merlinstoll.serverinfo
-        PRODUCT_NAME: Server Info
-        INFOPLIST_FILE: ServerInfo/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: nl.merlinstoll.nodestatus
+        PRODUCT_NAME: Node Status
+        INFOPLIST_FILE: NodeStatus/Resources/Info.plist
         ENABLE_USER_SCRIPT_SANDBOXING: YES
         SWIFT_STRICT_CONCURRENCY: complete
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
-  ServerInfoUITests:
+  NodeStatusUITests:
     type: bundle.ui-testing
     platform: iOS
     sources:
-      - path: ServerInfoUITests
+      - path: NodeStatusUITests
     dependencies:
-      - target: ServerInfo
+      - target: NodeStatus
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: nl.merlinstoll.serverinfo.uitests
-        TEST_TARGET_NAME: ServerInfo
+        PRODUCT_BUNDLE_IDENTIFIER: nl.merlinstoll.nodestatus.uitests
+        TEST_TARGET_NAME: NodeStatus
         GENERATE_INFOPLIST_FILE: YES
 schemes:
-  ServerInfo:
+  NodeStatus:
     build:
       targets:
-        ServerInfo: all
-        ServerInfoUITests: [test]
+        NodeStatus: all
+        NodeStatusUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
-        - ServerInfoUITests
+        - NodeStatusUITests

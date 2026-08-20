@@ -1,424 +1,145 @@
-# 05 — iOS-app
+# 05 — The iOS app
 
-## 5.1 Uitgangspunten
+## 5.1 Foundations
 
-- **SwiftUI**, minimum **iOS 26**, Swift 6 met strict concurrency.
-- Xcode 26.6 en Swift 6.3 staan al op je Mac ✅.
-- Doel-device: iPhone 16 Pro, iOS 26.6 (uit je screenshots). Dark mode is de primaire
-  look; light mode wordt correct ondersteund maar is niet leidend.
-- Géén externe dependencies. Charts komt uit Swift Charts, netwerk uit URLSession,
-  opslag uit SwiftData + Keychain.
+SwiftUI, iOS 26 minimum, Swift 6 with strict concurrency. No external dependencies: charts
+from Swift Charts, networking from URLSession, storage from JSON plus the Keychain.
 
-**Waarom iOS 26 als minimum:** de zwevende capsule-tabbar met glaseffect uit je
-screenshots is de standaard `TabView`-rendering in iOS 26 (Liquid Glass). Op iOS 18 zou je
-die volledig met de hand moeten namaken. Aangezien je toestel op 26.6 zit, kost dat minimum
-je niets en scheelt het honderden regels custom UI-code.
+iOS 26 as the floor is what gives the floating Liquid Glass tab bar for free. On iOS 18 it
+would have to be rebuilt by hand, which is hundreds of lines of custom UI for no gain.
 
-## 5.2 Navigatiestructuur
-
-**Vastgesteld: vier tabs — Server / Metrics / Tools / Settings.**
+## 5.2 Structure
 
 ```
 TabView (Liquid Glass, .tabBarMinimizeBehavior(.onScrollDown))
-├── Tab "Server"    systemImage: "server.rack"
-│    └── NavigationStack → ServerListView → ServerDetail/EditView
-├── Tab "Metrics"   systemImage: "chart.bar.xaxis"        ← default tab
-│    └── NavigationStack → MetricsView → Hardware/GPU/Sensors-details
-├── Tab "Tools"     systemImage: "wrench.and.screwdriver"
-│    └── NavigationStack → ToolsListView → per-tool detailschermen
-└── Tab "Settings"  systemImage: "gearshape"
-     └── NavigationStack → SettingsView
+├── Server     server list, pairing, per-server settings
+├── Metrics    the live screen — default tab
+├── Tools      network, hardware and system tools
+└── Settings   units, real-time behaviour, privacy, paired devices, language
 ```
 
-Er is bewust **geen aparte Hardware-tab**. De statische hardware-informatie (SMART, DIMM's,
-NIC's, block devices, GPU-specificaties) leeft op twee plekken die dichter bij de vraag
-zitten die je op dat moment hebt:
+Hardware information has no tab of its own. It lives as detail screens reachable from two
+places: the identity card at the top of **Metrics** (you are looking at a live CPU graph and
+want to know what CPU it is), and a **Hardware** section in Tools (you went looking for it
+deliberately). Hardware detail is something you open a few times per server and then never
+again — that does not deserve permanent space in the tab bar.
 
-- **Vanuit Metrics** — tik op de identiteitskaart bovenaan, of op de `GPU`/`Sensors`-knoppen,
-  en je duikt door naar het bijbehorende hardware-detailscherm. Je ziet iets in de
-  live-data en wilt weten *wat* het is: één tik.
-- **Vanuit Tools** — een eigen sectie **Hardware** met rijen naar dezelfde schermen, voor
-  als je gericht naar hardware-informatie op zoek bent zonder eerst langs de metrics te gaan.
+A **bottom accessory** floats above the tab bar with the selected server and its live
+CPU/RAM, so you always know which machine you are looking at. Lists get extra bottom
+content margin so their last row is not hidden underneath it.
 
-Dat scheelt een tab, houdt de tabbar in de vorm die je wilt, en het scheelt de gebruiker
-een scherm dat je in de praktijk maar een paar keer per server opent.
-
-**Bottom accessory (aanrader):** iOS 26 kent `.tabViewBottomAccessory { }` — een strook
-die boven de tabbar zweeft. Perfect om altijd de **geselecteerde server + live CPU/RAM**
-te tonen, ongeacht in welke tab je zit. Precies de functie die je beschrijft
-("als je op een ander menu-item drukt, zie je die van de geselecteerde server").
+## 5.3 State
 
 ```swift
-enum AppTab: Hashable { case server, metrics, tools, settings }
-```
-
-De tab-set is één enum met één `TabView`-body; toevoegen of hernoemen is een lokale
-wijziging op één plek.
-
-## 5.3 State-model
-
-```swift
-@Observable final class AppState {
-    var servers: [Server]           // uit SwiftData
-    var selectedServerID: UUID?
-    var connection: ConnectionState // .disconnected / .connecting / .live(since:) / .failed(Error)
-    var preferences: Preferences    // uit Settings-tab, zie §5.11
-}
-
-@Observable final class MetricsStore {          // één per geselecteerde server
-    private(set) var system: SystemInfo?         // /v1/system, 60 s cache
-    private(set) var latest: Sample?             // laatste SSE-sample
-    private(set) var history: RingBuffer<Sample> // 300 samples = 5 min
-    var cpuSeries:  [ChartPoint] { ... }
-    var netSeries:  (rx: [ChartPoint], tx: [ChartPoint]) { ... }
+@Observable @MainActor final class AppState {
+    var servers: [Server]
+    var selectedID: UUID?
+    var connection: ConnectionState   // idle / connecting / live / reconnecting / failed
+    var system: SystemInfo?
+    var latest: Sample?
+    var history = RingBuffer<Sample>(capacity: 300)
 }
 ```
 
-- `MetricsStore` is een `@MainActor`-geïsoleerde `@Observable` klasse; de SSE-parsing
-  gebeurt in een detached task en levert samples via een `AsyncStream` aan.
-- De **ringbuffer heeft een vaste grootte** — nooit een groeiende array; dat is de klassieke
-  reden waarom monitoring-apps na een uur 400 MB gebruiken.
-- Views observeren alleen wat ze nodig hebben. De netwerkgrafiek observeert `netSeries`,
-  het CPU-blok alleen `latest.cpu` — anders hertekent iOS 26× per seconde het hele scherm.
+The ring buffer has a **fixed size**. A growing array is the classic reason monitoring apps
+sit at 400 MB after an hour.
 
-## 5.4 Real-time pipeline (1 Hz)
+## 5.4 The 1 Hz pipeline
 
 ```
-URLSession.bytes(for: streamRequest)
-   → AsyncLineSequence
-   → SSEParser (event:/id:/data:)
-   → JSONDecoder → Sample
-   → await MainActor.run { store.append(sample) }
-   → SwiftUI hertekent alleen de views die dat sample lezen
+URLSession.bytes(for:) → AsyncLineSequence → SSE parser → JSONDecoder → Sample → @MainActor
 ```
 
-Regels die dit werkbaar houden:
+Rules that keep it smooth:
 
-1. **Alleen streamen als het scherm zichtbaar is.** `.task(id: selectedServerID)` op de
-   Metrics-view start de stream; verlaten van de view cancelt hem automatisch.
-2. **Stoppen bij achtergrond.** `scenePhase == .background` → stream sluiten. iOS zou hem
-   toch binnen ~30 s killen; netjes sluiten voorkomt een halve seconde bevroren UI bij
-   terugkeren.
-3. **Herverbinden met backoff** 1 s → 2 s → 5 s → 10 s (max), plus meteen een poging bij
-   `NWPathMonitor`-netwerkherstel. UI toont een discrete "reconnecting…"-pill, geen alert.
-4. **Animatie.** Voortgangsbalken animeren met `.animation(.easeOut(duration: 0.35), value:)`
-   — genoeg om vloeiend te ogen, kort genoeg om bij 1 Hz niet achter te lopen. Getallen
-   krijgen `.contentTransition(.numericText())` zodat cijfers rollen in plaats van
-   springen. Dat is precies het detail dat de app "af" laat voelen.
-5. **Geen `Timer` op de main thread** voor de UI-klok; de sample-`t` uit de server is de
-   waarheid.
+1. Stream only while the screen is visible; `.task(id:)` cancels it on the way out.
+2. Stop on background — iOS would kill it anyway, and closing cleanly avoids a frozen
+   second on return.
+3. Reconnect with backoff 1 → 2 → 5 → 10 s, shown as a discreet pill, never an alert.
+4. `.contentTransition(.numericText())` and `.monospacedDigit()` on everything that changes
+   every second. Without monospaced digits the layout visibly wobbles, because `1` is
+   narrower than `8`.
+5. No `Timer` for the clock — the sample's own timestamp is the truth.
 
-## 5.5 Netwerk-laag
+## 5.5 Networking
 
-```swift
-actor APIClient {
-    init(server: Server, credentials: Credentials)   // token + pinned SPKI hash
-    func get<T: Decodable>(_ path: String) async throws -> T
-    func post<T: Decodable>(_ path: String, body: Encodable) async throws -> T
-    func stream(_ path: String) -> AsyncThrowingStream<Sample, Error>
-}
+One code path for all four connection profiles: always send the client certificate, always
+validate the server against the CA received at pairing.
+
+Two subtleties cost real debugging time and are worth knowing:
+
+- **The TLS challenge for a stream arrives at task level.** Ordinary requests via
+  `URLSession.data(for:)` land in `urlSession(_:didReceive:)`, but `URLSession.bytes(for:)`
+  uses `urlSession(_:task:didReceive:)`. With only the first implemented, every endpoint
+  worked and only the live stream was rejected.
+- **URLSession opens several connections in parallel** and races them. During pairing the
+  first one succeeded, which closed the pairing window, and the second then failed the
+  handshake — so a successful pairing reported "the network connection was lost". The
+  pairing session is now limited to one connection per host, and the agent keeps accepting
+  unauthenticated connections for 15 seconds after a successful pairing.
+
+## 5.6 Stale data
+
+When the stream drops, the last known values stay on screen — a blank screen tells you
+less than old numbers do — but they are **dimmed**, a banner reports how long ago the last
+update was, and the uptime counter **stops**. Letting uptime tick on would assert the
+server is still running, which is exactly what is no longer known.
+
+## 5.7 The screens
+
+**Server** — cards with a live status dot, CPU/RAM/uptime and a sparkline, polled every
+5 s (not 1 s: enough to see whether a machine is alive without loading several of them).
+Tap to select, swipe to edit or delete.
+
+**Metrics** — identity card (model, storage, chip, memory, uptime, reboot date), four
+gauges (CPU, RAM, storage, load), a network section with a live chart, temperature with
+history, quick links to GPU and sensors, and a sensor grid.
+
+**Tools** — grouped list: network tools (speed, ping, DNS, traceroute, WHOIS), hardware
+(CPU detail, sensors, SMART, interfaces, overview) and system (log analyzer, updates,
+processes, locale, uptime).
+
+**Settings** — units, history window, privacy toggles, paired devices with swipe-to-revoke,
+and the language switch.
+
+## 5.8 Charts
+
+The network chart caused two rounds of fixes and both are worth recording:
+
+- **The scale is held in state with hysteresis.** Recomputing it from the current peak
+  every second made the whole chart rescale continuously, which reads as flicker. It now
+  grows immediately and only shrinks after ten quiet seconds.
+- **The peak is taken over the visible window only.** It was computed over the whole
+  300-sample buffer, so a spike from four minutes ago inflated the scale while being
+  invisible — and 600 marks were being drawn where 120 were shown.
+- **`chartPlotStyle { $0.clipped() }`**, or line and fill spill past the card edge.
+- **Y labels are drawn as an overlay inside the plot**, not as axis labels. Axis labels
+  reserve width on the left, which made the chart narrower than the sparkline below it.
+
+## 5.9 Localisation
+
+English is the default. Dutch is offered **only when the device language is Dutch** —
+otherwise it is a choice nobody who sees it wants.
+
+Rather than `.strings` files, translations sit inline: `T("Storage", "Opslag")`. For a
+two-language personal app that is deterministic, works naturally with string interpolation,
+switches instantly without restarting, and keeps the translation next to the text it
+belongs to. The trade-off is that it is not the idiomatic Apple mechanism and cannot be
+handed to a translator — acceptable here, and worth revisiting if a third language ever
+appears.
+
+## 5.10 Verification
+
+`NodeStatusUITests` walks the whole app and writes 19 screenshots to
+`/tmp/nodestatus-shots/`. It is not an assertion test but a visual one: run it, look at the
+images, compare against the reference. It caught the hidden last row, the flickering chart
+and several layout regressions.
+
+```bash
+cd ios && xcodebuild -project NodeStatus.xcodeproj -scheme NodeStatus \
+  -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-- **Client-certificaat (mTLS).** De `URLSessionDelegate` beantwoordt
-  `NSURLAuthenticationMethodClientCertificate` met de `SecIdentity` van deze server uit de
-  Keychain. Zonder die identiteit komt er geen verbinding tot stand — dat is de kern van
-  [10 — Device enrollment](10-device-enrollment.md).
-- **Servervalidatie tegen de per-server CA.** Bij `NSURLAuthenticationMethodServerTrust`
-  evalueert de app het servercertificaat tegen het **CA-certificaat dat bij enrollment is
-  ontvangen** (`SecTrustSetAnchorCertificates`). Dus geen TOFU, geen fingerprint-vergelijking
-  en geen afhankelijkheid van publieke CA's — ook niet op `a.mest.dev`. Een servercert dat
-  niet door die CA is uitgegeven, wordt geweigerd.
-- **Token-header:** standaard `Authorization: Bearer`, met een schakelaar per server naar
-  `X-Server-Info-Token` voor servers achter een proxy die zelf basic auth gebruikt.
-  De app probeert bij *Test verbinding* beide en onthoudt wat werkte.
-- **Basis-pad:** de host mag een pad-prefix bevatten (`a.mest.dev/_si`); de `APIClient`
-  plakt endpoints daar correct achter.
-- **Dual-host failover:** `lan_host` en `remote_host` worden parallel geprobeerd
-  (`withTaskGroup`, eerste succes wint, 300 ms head start voor LAN).
-- **Hostnames boven IP-literals voor remote hosts.** Op IPv6-only mobiele netwerken
-  (NAT64/DNS64 — Apple vereist dat apps daar werken) faalt een hardgecodeerd IPv4-adres
-  terwijl een hostname het wél doet. De app waarschuwt bij een IPv4-literal als remote host.
-- **Timeouts:** 5 s voor gewone requests, geen timeout op de stream (keep-alive bewaakt hem).
-- **Info.plist:** `NSAllowsLocalNetworking` voor .local/IP-literals + de
-  `NSLocalNetworkUsageDescription`-string die iOS toont bij het eerste LAN-contact.
-  Voor `.system`-servers is géén ATS-uitzondering nodig.
-
-## 5.6 Tab "Server"
-
-**Leeg** — grote SF Symbol, "Nog geen servers", knop *Server toevoegen*, plus een tweede
-knop *QR scannen*.
-
-**Gevuld** — een lijst kaarten, per server:
-
-```
-┌──────────────────────────────────────────────┐
-│ ● web-01                      ✓ selected     │  ● groen = online, grijs = offline,
-│   192.168.1.50 · Ubuntu 24.04                │      oranje = reconnecting
-│   ▁▂▅▃▂▁  CPU 22%   RAM 89%   up 1d 18h      │  mini-sparkline, ververst op 5 s
-└──────────────────────────────────────────────┘
-```
-
-- **Tik** = selecteren (haptische tik + de vinkje-badge verspringt). Er is altijd precies
-  één geselecteerde server; die keuze wordt bewaard tussen sessies.
-- **Swipe** = Bewerken / Verwijderen. Long-press = contextmenu met *Nu verversen*,
-  *Token vernieuwen*, *Dupliceren*.
-- De lijst pollt op **5 s** (niet 1 s) met `sections=cpu,memory` — genoeg voor een
-  statusindicatie, zonder vier servers tegelijk te belasten.
-
-**Toevoegen — formulier**
-
-| Veld | Type | Default |
-|------|------|---------|
-| Naam | tekst | uit `/v1/system` na verbinden |
-| Host (LAN) | tekst | — |
-| Host (extern, optioneel) | tekst, mag pad bevatten (`a.mest.dev/_si`) | — |
-| Poort | nummer | 29500 (leeg bij een proxy op 443) |
-| Token | secure field / plak / QR | — |
-| Koppelcode | uit de QR, of handmatig | — |
-| Apparaatnaam | tekst | toestelnaam |
-| Kleur/icoon | picker | willekeurig |
-
-Onderaan een **Test verbinding**-knop die `/v1/health` en `/v1/system` doet en het
-resultaat inline toont (versie, hostname, OS, capabilities) vóór je opslaat. Opslaan kan
-pas na een geslaagde test — dat voorkomt de grootste bron van "waarom doet-ie niks".
-
-**Koppelen via QR (de standaardroute):** de scanner leest
-`serverinfo://enroll?h=192.168.1.50&p=29500&fp=<sha256>&c=K7QM3XR9&n=web-01`. De app
-genereert een sleutelpaar, stuurt een CSR, en krijgt certificaat, CA en token terug — de
-gebruiker ziet alleen een voortgangsbalkje en daarna de server in de lijst. Het handmatige
-formulier hierboven is de terugvaloptie als de QR niet gescand kan worden.
-
-**Instructiescherm.** Voordat de camera opengaat, toont de app het commando dat op de
-server gedraaid moet worden, met een kopieerknop:
-
-```
-curl -fsSL https://get.<jouwdomein>/si | sudo bash
-```
-
-Daaronder: "Scan daarna de QR die in je terminal verschijnt." Dat is de volledige
-onboarding — zie [10 §10.3](10-device-enrollment.md#103-de-koppelflow-klik-en-klaar).
-
-**Serverdetail** (tik op de naam in plaats van op de kaart, of via het contextmenu):
-verbindingsstatus, gemeten latency, agent-versie, capabilities, en per-server instellingen
-die de globale defaults uit [§5.11](#511-tab-settings) overschrijven (refresh-interval,
-mag-speedtesten, welke secties zichtbaar zijn).
-
-## 5.7 Tab "Metrics"
-
-Exact de opbouw uit je screenshots, van boven naar beneden:
-
-### A. Header
-`Device Status` in `.largeTitle.bold()`, subtitel `Real-time monitoring · web-01`.
-Rechts een kleine live-indicator (pulserend groen bolletje + "LIVE").
-
-### B. Identiteitskaart — tevens ingang naar Hardware
-Icoon links (server.rack in een afgeronde gekleurde tegel), daarnaast hostname groot en
-`Ubuntu 24.04.1 (6.8.0-45)` eronder. Daaronder een 2×3-grid:
-
-| Model | Storage |
-|-------|---------|
-| Chip | Memory |
-| Uptime | Reboot Date |
-
-Labels in `.subheadline` wit, waarden in `.subheadline` secundair grijs — net als in je
-screenshot. Uptime telt **live** door (`1d 18h 54m 47s`), berekend uit `boot_time` +
-de wandklok, dus zonder serververkeer.
-
-De hele kaart is tapbaar en heeft rechtsonder een subtiele chevron: tik → **Hardware-detail**
-([§5.8](#58-hardware-detailschermen)). Zo blijft de hardware-informatie één tik weg zonder
-een eigen tab te kosten.
-
-### C. Vier metrische tegels (2×2)
-
-| Tegel | Balk-gradient | Extra tekst |
-|-------|---------------|-------------|
-| **CPU** | blauw → cyaan | `64.4%` groot rechts |
-| **RAM** | blauw → cyaan | `6.7 G / 7.5 G` links, `89.4%` rechts |
-| **Storage** | magenta → rood | `163.1 G / 255.4 G` links, `63.9%` rechts |
-| **Load / Swap** | groen → mint | `0.84 / 0.61 / 0.55` (vervangt "Battery" — een server heeft geen accu) |
-
-Zie [06 — Designsysteem](06-design-system.md) voor exacte kleuren en de `GaugeBar`-component.
-
-### D. Netwerk-sectie
-- Kop met wifi/ethernet-icoon + interfacenaam.
-- `Total Usage` met ↓ 3,5 GB en ↑ 1,8 GB (sinds boot).
-- Rechtsboven in de chart de huidige snelheden: `5.1 K/s ↑` groen, `9.2 K/s ↓` blauw.
-- **Chart:** Swift Charts, twee `AreaMark`+`LineMark`-lagen (groen up, blauw down), 60
-  datapunten, gestippelde horizontale gridlijnen met schaal-labels links (`512 KB/s`,
-  `384 KB/s`, …). De x-as heeft geen labels — alleen drie verticale stippellijnen.
-- **Beweging van rechts naar links:** de x-as is `chartXScale(domain: -60...0)` met
-  x = `sample.t - now`. Elk nieuw sample schuift alles automatisch naar links. De y-as
-  gebruikt een "sticky max": schaal naar `max(historie) * 1.2`, afgerond op een mooie stap,
-  en zakt pas terug na 10 s zonder piek — anders klapt de grafiek visueel heen en weer.
-- Tik op de chart → detailscherm met per-interface uitsplitsing en een langere historie.
-
-### E. Temperatuur-sectie
-Grote waarde rechts (`29°C`, gekleurd naar status), met een sparkline eronder over de
-laatste 5 minuten. Precies de layout uit je derde screenshot.
-
-### F. GPU + Sensors (twee knoppen naast elkaar)
-De `GPU | Screen`-rij uit je screenshot wordt `GPU | Sensors` — twee tappable helften met
-icoon en label die naar de hardware-detailschermen navigeren. De GPU-helft is verborgen als
-`capabilities` geen GPU bevat; dan vult Sensors de volle breedte.
-
-### G. Sensors-sectie
-Kop `Sensors` met een chevron om in/uit te klappen, rechts de badges
-`✅ Available 12` en `❌ Not Available 2`. Daaronder een grid van 2 kolommen met per sensor
-een ronde icoontegel + groen vinkje-badge + naam eronder, exact als je screenshot.
-Tik op een sensor → waarde-detail met historie.
-
-## 5.8 Hardware-detailschermen
-
-Geen tab, maar een set `NavigationStack`-schermen die bereikbaar zijn vanuit **Metrics**
-(identiteitskaart, GPU/Sensors-knoppen) én vanuit de **Hardware-sectie in Tools**
-([§5.9](#59-tab-tools)). Eén overzichtsscherm `HardwareView` met secties, en per sectie een
-dieper scherm:
-
-| Scherm | Inhoud |
-|--------|--------|
-| **Systeem** | Vendor, product, serienummer (gemaskeerd), BIOS/firmware, virtualisatie, distro, kernel, architectuur |
-| **CPU** | Model, sockets/cores/threads, caches, notabele flags, governor per core, huidige frequenties |
-| **Geheugen** | Totaal, gebruikt/cached/buffers, swap, en per DIMM (slot, grootte, type, snelheid) als `dmidecode` beschikbaar is |
-| **Opslag** | Per block device: model, grootte, type (NVMe/SSD/HDD), partities, filesystem, **SMART-health**, temperatuur, power-on-hours, wear level. RAID/LVM/ZFS-status als aanwezig |
-| **Netwerk** | Per NIC: MAC, MTU, linksnelheid, IPv4/IPv6, gateway, DNS-servers, totaal verkeer |
-| **GPU** | Kaart, driver, VRAM, klokken, temperatuur, vermogen, huidige processen |
-| **Sensors** | Alle hwmon-chips gegroepeerd, per sensor waarde + drempels + historie-sparkline, filter op type |
-
-Deze data komt uit `/v1/system` en `/v1/hardware/*` met 60 s cache — bewust niet uit de
-1 Hz-stream, want het verandert niet.
-
-## 5.9 Tab "Tools"
-
-Gegroepeerde lijst, exact het patroon uit je vierde screenshot (gekleurde afgeronde
-icoontegels, chevrons, secties met kopjes):
-
-**Netwerk**
-| Tool | Scherm |
-|------|--------|
-| Network Speed | Grote knop *Start test*, tijdens de run een animerende gauge; resultaat als drie grote cijfers (Download / Upload / Ping) + jitter, loss, server, ISP. Historie van eerdere tests eronder in een lijst met sparkline. |
-| Ping | Doelveld, aantal, *Start*. Resultaat: live oplopende sparkline van RTT's + min/avg/max/mdev-tegels + packet loss. |
-| DNS Query | Domein + recordtype-picker (A/AAAA/MX/TXT/NS/CNAME/SOA) + DNS-server-picker (systeem, 1.1.1.1, 8.8.8.8, custom). Resultaten als kaarten met TTL. |
-| Traceroute | Hop-voor-hop verschijnend, met per hop RTT-balkje en reverse-DNS. |
-| WHOIS | Domein → geparste kaart (registrar, aangemaakt, verloopt, nameservers) + ruwe tekst uitklapbaar. |
-
-**Hardware** *(ingang naar de schermen uit [§5.8](#58-hardware-detailschermen))*
-| Tool | Scherm |
-|------|--------|
-| CPU Information | Totaal/user/system-chart (drie lijnen, zoals je screenshot), per-core balkjes met historie-toggle, frequenties, governor, load-average-chart. |
-| Sensors | Alle sensoren met waarden, drempels en historie. |
-| Storage & SMART | Block devices, partities, health per schijf. |
-| Memory | Totaal/gebruikt/cached/swap + DIMM-details. |
-| Network Interfaces | Per NIC alle details en verkeer. |
-| GPU | Alleen zichtbaar met GPU-capability. |
-
-**Systeem**
-| Tool | Scherm |
-|------|--------|
-| Processes | Volledige proceslijst, sorteerbaar op CPU / geheugen / naam, met zoekveld. Per regel een balkje voor het aandeel. Beantwoordt de vraag die "RAM 89%" oproept, zonder Metrics te overladen. |
-| Log Analyzer | Zie [§5.10](#510-log-analyzer--hoe-dit-nuttig-wordt). |
-| System & Updates | Aantal upgradable + security-badge, lijst pakketten met huidige→nieuwe versie, "reboot required"-banner, kernelversie, distro-EOL-datum, unattended-upgrades-status. **Read-only** — geen upgrade-knop (zie OQ-3). |
-| Locale & Region | Exact het key/value-scherm uit je screenshot: locale identifier, region, language, preferred languages, keyboard, timezone + offset, calendar, first day of week, hour cycle, currency, NTP-sync. |
-| Device Uptime | Uptime groot, boot-datum, load-average-chart over 5 min, en een lijst van de laatste 10 boots met duur. In plaats van de wake/sleep-donut uit je screenshot (niet zinvol op een server): een donut **CPU-tijd verdeeld over user / system / iowait / idle** sinds boot — dezelfde visuele taal, wel relevante data. |
-
-Alle tools werken op de **geselecteerde server**; bovenaan de lijst staat een compacte rij
-met servernaam en status, zodat je nooit per ongeluk op de verkeerde machine een speedtest
-start.
-
-### 5.10 Log Analyzer — hoe dit nuttig wordt
-
-Je screenshot toont een importeer-flow voor een sysdiagnose; op een server is de
-equivalente en veel bruikbaardere versie:
-
-1. **Bronkeuze.** De app haalt `/v1/tools/logs/sources` op en toont wat er is:
-   journal-units (ssh, nginx, docker, cron, ufw, kernel) en logbestanden. Elke bron toont
-   het aantal regels in het laatste uur en het hoogste priority-niveau — zo zie je meteen
-   waar iets mis is zonder te zoeken.
-2. **Filterbalk.** Tijdvenster (15 m / 1 u / 24 u / 7 d), minimum-priority
-   (error / warning / info / debug) en een zoekveld.
-3. **Weergave.** Monospace-regels, links een gekleurd priority-streepje
-   (rood err+, oranje warning, grijs info), tijd relatief ("2m geleden") met absolute tijd
-   bij tik. Regels zijn selecteerbaar en deelbaar.
-4. **Live tail.** Een schakelaar rechtsboven zet `/v1/tools/logs/stream` aan; nieuwe regels
-   schuiven van onderen in met auto-scroll die pauzeert zodra je zelf omhoog scrollt.
-5. **Samenvatting bovenaan** — een strook met tellingen per niveau over het gekozen venster
-   en een mini-histogram van regels per minuut, zodat een piek meteen opvalt.
-
-Dit is de reden om de log-tool te bouwen: niet om `journalctl` na te bouwen, maar om in
-één blik te zien *waar* het druk of fout is.
-
-## 5.11 Tab "Settings"
-
-App-brede instellingen. Alles hier is een **globale default**; per server kun je ze
-overschrijven in het serverdetail ([§5.6](#56-tab-server)). `.listStyle(.insetGrouped)`,
-zelfde visuele taal als Tools.
-
-**Weergave**
-| Instelling | Opties | Default |
-|-----------|--------|---------|
-| Thema | Systeem / Licht / Donker | Systeem |
-| Accentkleur | picker | Blauw |
-| Standaardtab bij openen | Server / Metrics / Tools | Metrics |
-| Secties in Metrics | herordenen + aan/uit per sectie | alles aan |
-
-**Eenheden**
-| Instelling | Opties | Default |
-|-----------|--------|---------|
-| Temperatuur | °C / °F | °C |
-| Opslag & geheugen | GB (1000) / GiB (1024) | GB |
-| Netwerksnelheid | bytes/s / bits/s | bytes/s |
-| Tijdnotatie | 12u / 24u / systeem | Systeem |
-
-**Real-time**
-| Instelling | Opties | Default |
-|-----------|--------|---------|
-| Refresh-interval | 1 s / 2 s / 5 s | 1 s |
-| Historievenster in charts | 1 / 5 / 15 min | 1 min (chart), 5 min (buffer) |
-| Streamen op mobiel netwerk | aan / uit | aan |
-| Terugvallen op polling als SSE faalt | aan / uit | aan |
-
-**Privacy & beveiliging**
-| Instelling | Opties | Default |
-|-----------|--------|---------|
-| App vergrendelen met Face ID | aan / uit | uit |
-| Serienummers en publieke IP's maskeren | aan / uit | **aan** |
-| Hostnames anonimiseren bij delen/screenshot | aan / uit | uit |
-| Gekoppelde apparaten | per server een lijst, swipe om in te trekken | — |
-| Certificaat-status | per server: verloopdatum + automatische vernieuwing | auto |
-
-**Data**
-| Instelling | Opties | Default |
-|-----------|--------|---------|
-| Waarschuwen vóór speedtest (verbruikt 1–3 GB) | aan / uit | **aan** |
-| Speedtest-historie bewaren | 10 / 50 / uit | 10 |
-| Alle lokale data wissen | knop met bevestiging | — |
-
-**Over**
-- App-versie + buildnummer, en per verbonden server de **agent-versie** met een
-  waarschuwing als die ouder is dan de app verwacht (API-versie-mismatch).
-- Link naar de agent-installatie-instructies en het `uninstall.sh`-commando — handig als je
-  op je telefoon zit en wilt opzoeken hoe je een agent verwijdert.
-- Diagnostiek: laatste 100 app-logregels, deelbaar. Geen analytics, geen crash-reporting
-  naar derden — dat staat er expliciet bij.
-
-## 5.12 Foutafhandeling en lege staten
-
-Elk scherm heeft drie toestanden en die worden allemaal expliciet ontworpen:
-
-| Toestand | Weergave |
-|----------|----------|
-| Geen server geselecteerd | Vriendelijke lege staat met knop naar de Server-tab |
-| Server offline | Laatste bekende data **grijs/gedimd** + banner "Laatste update 2 min geleden" — nooit een leeg scherm |
-| Feature niet beschikbaar | Sectie verborgen, of een rij "Vereist smartmontools op de server" met uitleg |
-| Auth mislukt (401) | Alert met knop *Token bijwerken* die direct naar het edit-scherm gaat |
-| Certificaat gewijzigd / niet door de CA getekend | Blokkerende waarschuwing, verbinding geweigerd |
-| Client-certificaat verlopen of ingetrokken | Scherm "Opnieuw koppelen" met het commando om een nieuw venster te openen |
-
-## 5.13 Toegankelijkheid en polish
-
-- Dynamic Type tot XXL: kaarten groeien mee, grids vallen terug naar één kolom.
-- VoiceOver-labels op elke gauge ("CPU-gebruik, 64 procent").
-- Kleur is nooit de enige informatiedrager (status krijgt ook een icoon).
-- Haptics: lichte tik bij serverselectie, succes-notificatie bij afgeronde speedtest.
-- `Reduce Motion` → chart-animaties uit, waarden springen direct.
-- Live Activity / Dynamic Island voor een lopende speedtest is een leuke stretch goal
-  (en past bij de "Show In Dynamic Island"-knoppen uit je screenshots).
+Two launch arguments exist **only in DEBUG builds**: `-SIPairURL <nodestatus://enroll?…>`
+pairs automatically at launch, and `-SITab server|metrics|tools|settings` opens a specific
+tab. They exist because the simulator has no camera.
